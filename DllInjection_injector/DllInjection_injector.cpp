@@ -238,6 +238,43 @@ inject_dll_to_target(
 	return true;
 }
 
+bool inject_all_process(bool injection,
+						const wchar_t* dll_path)
+{
+	DWORD pid = 0;
+	HANDLE snapshot = INVALID_HANDLE_VALUE;
+	PROCESSENTRY32W pe;
+
+	pe.dwSize = sizeof(PROCESSENTRY32W);
+	snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPALL, NULL);
+
+	Process32FirstW(snapshot, &pe);
+	do
+	{
+		pid = pe.th32ProcessID;
+
+		if (pid < 100)
+		{
+			continue;
+		}
+
+		if (true != injection)
+		{
+			_tprintf(_T("inject_dll_to_target failed.process_name:%ws, file_path:%ws"),
+					 pe.szExeFile, dll_path);
+		}
+		else
+		{
+			if (true != inject_dll_to_target(pid, dll_path))
+			{
+				_tprintf(_T("inject_dll_to_target failed.process_name:%ws, file_path:%ws"), 
+						 pe.szExeFile, dll_path);
+				continue;
+			}
+		}
+	} while (Process32NextW(snapshot, &pe));
+	return true;
+}
 int main()
 {
 	_tprintf(_T("Inject dll path: "));
