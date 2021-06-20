@@ -32,6 +32,7 @@ typedef NTSTATUS(NTAPI* pfnRtlCreateUserThread)(
 	IN PVOID Parameter OPTIONAL,
 	OUT PHANDLE ThreadHandle OPTIONAL,
 	OUT CLIENT_ID* ClientId OPTIONAL);
+
 bool
 print_process_list()
 {
