@@ -2,11 +2,37 @@
 #include <tchar.h>
 #include <Windows.h>
 #include <TlHelp32.h>
+#include <winternl.h>
 
 #define INJECTION_MODE	0
 #define EJECTION_MODE	1	
 
-typedef void(*PFN_SetProcName)(const TCHAR* szProcName);
+typedef void(*PFN_SetProcName)(const char* szProcName);
+typedef NTSTATUS(NTAPI* pfnNtCreateThreadEx)
+(
+	OUT PHANDLE hThread,
+	IN ACCESS_MASK DesiredAccess,
+	IN PVOID ObjectAttributes,
+	IN HANDLE ProcessHandle,
+	IN PVOID lpStartAddress,
+	IN PVOID lpParameter,
+	IN ULONG Flags,
+	IN SIZE_T StackZeroBits,
+	IN SIZE_T SizeOfStackCommit,
+	IN SIZE_T SizeOfStackReserve,
+	OUT LPVOID lpBytesBuffer);
+
+typedef NTSTATUS(NTAPI* pfnRtlCreateUserThread)(
+	IN HANDLE ProcessHandle,
+	IN PSECURITY_DESCRIPTOR SecurityDescriptor OPTIONAL,
+	IN BOOLEAN CreateSuspended,
+	IN ULONG StackZeroBits OPTIONAL,
+	IN SIZE_T StackReserve OPTIONAL,
+	IN SIZE_T StackCommit OPTIONAL,
+	IN PTHREAD_START_ROUTINE StartAddress,
+	IN PVOID Parameter OPTIONAL,
+	OUT PHANDLE ThreadHandle OPTIONAL,
+	OUT CLIENT_ID* ClientId OPTIONAL);
 
 DWORD convert_ansi_to_unicode_string(
 	__out std::wstring& unicode,
@@ -69,7 +95,8 @@ DWORD convert_unicode_to_ansi_string(
 		int required_cch = ::WideCharToMultiByte(
 			CP_ACP,
 			0,
-			unicode, static_cast<int>(unicode_size),
+			unicode, 
+			-1,
 			nullptr, 0,
 			nullptr, nullptr
 		);
@@ -87,7 +114,8 @@ DWORD convert_unicode_to_ansi_string(
 		if (0 == ::WideCharToMultiByte(
 			CP_ACP,
 			0,
-			unicode, static_cast<int>(unicode_size),
+			unicode, 
+			-1,
 			const_cast<char*>(ansi.c_str()), static_cast<int>(ansi.size()),
 			nullptr, nullptr
 		)) {
@@ -248,34 +276,144 @@ InjectDll(
 	_In_ DWORD dwPID, 
 	_In_ const char* szDllPath)
 {
-	HANDLE                  hProcess, hThread;
-	LPVOID                  pRemoteBuf;
+	HANDLE                  hProcess = NULL, hThread = NULL;
+	HMODULE					hModule = NULL;
+	LPVOID                  pRemoteBuf = nullptr;
+	LPTHREAD_START_ROUTINE  pThreadProc = nullptr;
 	DWORD                   dwBufSize = strlen(szDllPath) + 1;
-	LPTHREAD_START_ROUTINE  pThreadProc;
-
-	if (!(hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, dwPID)))
+	DWORD					err_num = ERROR_SUCCESS;
+	do
 	{
-		printf("OpenProcess(%d) failed!!!\n", dwPID);
-		return false;
+		hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, dwPID);
+		if (NULL == hProcess)
+		{
+			printf("OpenProcess(%d) failed!!!\n", dwPID);
+			break;
+		}
+
+		pRemoteBuf = VirtualAllocEx(hProcess, 
+									NULL, 
+									dwBufSize,
+									MEM_COMMIT, 
+									PAGE_READWRITE);
+		if (nullptr == pRemoteBuf)
+		{
+			printf("VirtualAllocEx failed!!!\n");
+			break;
+		}
+
+		if (TRUE != WriteProcessMemory(hProcess, 
+									   pRemoteBuf,
+									   (LPVOID)szDllPath, 
+									   dwBufSize, 
+									   NULL))
+		{
+			printf("WriteProcessMemory failed!!!\n");
+			break;
+		}
+
+		hModule = GetModuleHandle(_T("kernel32.dll"));
+		if (NULL == hModule)
+		{
+			printf("GetModuleHandle failed!!!\n");
+			break;
+		}
+
+		pThreadProc = (LPTHREAD_START_ROUTINE)
+			GetProcAddress(GetModuleHandle(_T("kernel32.dll")),
+						   "LoadLibraryW");
+		if (NULL == pThreadProc)
+		{
+			printf("GetProcAddress failed!!! Gle:%u\n", GetLastError());
+			break;
+		}
+		hThread = CreateRemoteThread(hProcess, NULL, 0,
+									 pThreadProc, pRemoteBuf, 0, NULL);
+		if (NULL == hThread)
+		{
+			err_num = GetLastError();
+			_tprintf(_T("CreateRemoteThread failed. GetLastError:%u\n"), err_num);
+			do
+			{
+				if (err_num == ERROR_ACCESS_DENIED)
+				{
+					if (nullptr != pRemoteBuf)
+					{
+						VirtualFreeEx(hProcess,
+									  pRemoteBuf,
+									  dwBufSize,
+									  MEM_RELEASE);
+						pRemoteBuf = nullptr;
+					}
+
+					if (NULL != hProcess)
+					{
+						CloseHandle(hProcess);
+						hProcess = NULL;
+					}
+
+					break;
+				}
+
+				if (err_num == ERROR_NOT_ENOUGH_MEMORY)
+				{
+					HMODULE hntdll = LoadLibrary(_T("ntdll.dll"));
+					if (NULL == hntdll)
+					{
+						err_num = GetLastError();
+						_tprintf(_T("LoadLibrary ntdll.dll failed. GetLastError:%u\n"), err_num);
+						break;
+					}
+
+					CLIENT_ID cid;
+					pfnRtlCreateUserThread RtlCreateUserThread = (pfnRtlCreateUserThread)GetProcAddress(GetModuleHandle(_T("ntdll.dll")), "RtlCreateUserThread");
+					if (nullptr == RtlCreateUserThread)
+					{
+						err_num = GetLastError();
+						_tprintf(_T("GetProcAddress failed. GetLastError:%u\n"), err_num);
+						break;
+					}
+					else
+					{
+						NTSTATUS status = 0;
+						status = RtlCreateUserThread(hProcess,
+													 NULL,
+													 FALSE,
+													 0, 0, 0,
+													 (LPTHREAD_START_ROUTINE)pThreadProc,
+													 pRemoteBuf,
+													 &hThread,
+													 &cid);
+
+						if (!NT_SUCCESS(status) || NULL == hThread)
+						{
+							_tprintf(_T("RtlCreateUserThread failed.\n"));
+							break;
+						}
+					}
+				}
+			} while (false);
+		}
+
+		WaitForSingleObject(hThread, INFINITE);
+	} while (false);
+
+	if (nullptr != pRemoteBuf && NULL != hProcess)
+	{
+		VirtualFreeEx(hProcess, pRemoteBuf, 0, MEM_RELEASE);
+		pRemoteBuf = nullptr;
 	}
-
-	pRemoteBuf = VirtualAllocEx(hProcess, NULL, dwBufSize,
-								MEM_COMMIT, PAGE_READWRITE);
-
-	WriteProcessMemory(hProcess, pRemoteBuf,
-		(LPVOID)szDllPath, dwBufSize, NULL);
-
-	pThreadProc = (LPTHREAD_START_ROUTINE)
-		GetProcAddress(GetModuleHandle(_T("kernel32.dll")),
-					   "LoadLibraryA");
-	hThread = CreateRemoteThread(hProcess, NULL, 0,
-								 pThreadProc, pRemoteBuf, 0, NULL);
-	WaitForSingleObject(hThread, INFINITE);
-
-	VirtualFreeEx(hProcess, pRemoteBuf, 0, MEM_RELEASE);
-
-	CloseHandle(hThread);
-	CloseHandle(hProcess);
+	
+	if (NULL != hThread)
+	{
+		CloseHandle(hThread);
+		hThread = NULL;
+	}
+	if (NULL != hProcess)
+	{
+		CloseHandle(hProcess);
+		hProcess = NULL;
+	}
 
 	return true;
 }
@@ -363,7 +501,7 @@ InjectAllProcess(
 		// 시스템의 안정성을 위해서
 		// PID 가 100 보다 작은 시스템 프로세스에 대해서는
 		// DLL Injection 을 수행하지 않는다.
-		if (dwPID < 100)
+		if (dwPID < 100 || dwPID == GetCurrentProcessId())
 			continue;
 
 		if (mode == INJECTION_MODE)
@@ -397,14 +535,23 @@ _tmain(int argc, TCHAR* argv[])
 	SetPrivilege(SE_DEBUG_NAME,
 				 TRUE);
 
-	if (0 != _tcsicmp(argv[1], _T("-show")))
+	if (0 == _tcsicmp(argv[1], _T("-show")))
 	{
 		mode = EJECTION_MODE;
 	}
 
 	lib = LoadLibrary(argv[3]);
 	setprocname = (PFN_SetProcName)GetProcAddress(lib, "SetProcName");
-	setprocname(argv[2]);
+	std::string proc_name;
+	if (ERROR_SUCCESS != convert_unicode_to_ansi_string(proc_name,
+														argv[2],
+														sizeof(argv[2])))
+	{
+		_tprintf(_T("convert_unicode_to_ansi_string failed. argv[2]:%s", argv[2]));
+		return 1;
+	}
+
+	setprocname(proc_name.c_str());
 
 	std::string dll_path;
 	if (ERROR_SUCCESS != convert_unicode_to_ansi_string(dll_path,

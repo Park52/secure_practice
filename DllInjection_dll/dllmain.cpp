@@ -4,7 +4,7 @@
 *****************************************************/
 
 #include "pch.h"
-#include <stdio.h>
+#include <iostream>
 #include <Windows.h>
 #include <string.h>
 #include <tchar.h>
@@ -83,6 +83,55 @@ typedef BOOL(WINAPI *PFCREATEPROCESSW)(
 BYTE g_pOrgCPA[5] = { 0, };
 BYTE g_pOrgCPW[5] = { 0, };
 BYTE g_pOrgZwQSI[5] = { 0, };
+
+DWORD convert_unicode_to_ansi_string(
+	__out std::string& ansi,
+	__in const wchar_t* unicode,
+	__in const size_t unicode_size
+) {
+	DWORD error = 0;
+	do {
+		if ((nullptr == unicode) || (0 == unicode_size)) {
+			error = ERROR_INVALID_PARAMETER;
+			break;
+		}
+		ansi.clear();
+		//
+		// getting required cch.
+		//
+		int required_cch = ::WideCharToMultiByte(
+			CP_ACP,
+			0,
+			unicode,
+			/*static_cast<int>(unicode_size)*/-1,
+			nullptr, 0,
+			nullptr, nullptr
+		);
+		if (0 == required_cch) {
+			error = ::GetLastError();
+			break;
+		}
+		//
+		// allocate.
+		//
+		ansi.resize(required_cch);
+		//
+		// convert.
+		//
+		if (0 == ::WideCharToMultiByte(
+			CP_ACP,
+			0,
+			unicode,
+			/*static_cast<int>(unicode_size)*/-1,
+			const_cast<char*>(ansi.c_str()), static_cast<int>(ansi.size()),
+			nullptr, nullptr
+		)) {
+			error = ::GetLastError();
+			break;
+		}
+	} while (false);
+	return error;
+}
 
 BOOL hook_by_code(
 	const wchar_t* szDllName, 
@@ -389,21 +438,6 @@ APIENTRY DllMain(HMODULE hModule,
 				 LPVOID lpReserved
 )
 {
-	TCHAR current_proc[MAX_PATH] = { 0, };
-	TCHAR* p = nullptr;
-
-	GetModuleFileName(nullptr, current_proc, MAX_PATH);
-	p = _tcsrchr(current_proc, _T('\\'));
-
-	if (p != nullptr)
-	{
-		// DllInjection_injector
-		if (0 == _tcsicmp(p + 1, _T("HideTargetProcess.exe")));
-		{
-			return TRUE;
-		}
-	}
-
 	SetPrivilege(SE_DEBUG_NAME, true);
 
     switch (ul_reason_for_call)
