@@ -320,7 +320,7 @@ InjectDll(
 		}
 
 		pThreadProc = (LPTHREAD_START_ROUTINE)
-			GetProcAddress(GetModuleHandle(_T("kernel32.dll")),
+			GetProcAddress(hModule,
 						   "LoadLibraryW");
 		if (NULL == pThreadProc)
 		{
@@ -501,13 +501,17 @@ InjectAllProcess(
 		// 시스템의 안정성을 위해서
 		// PID 가 100 보다 작은 시스템 프로세스에 대해서는
 		// DLL Injection 을 수행하지 않는다.
-		if (dwPID < 100 || dwPID == GetCurrentProcessId())
+		if (dwPID < 1000 || dwPID == GetCurrentProcessId())
 			continue;
 
 		if (mode == INJECTION_MODE)
+		{
 			InjectDll(dwPID, szDllPath);
+		}		
 		else
+		{
 			EjectDll(dwPID, szDllPath);
+		}
 	} while (Process32Next(hSnapShot, &pe));
 
 	CloseHandle(hSnapShot);

